@@ -258,7 +258,7 @@ Common templates:
 - Use `yarn task e2e-tests --start-from auto` or `yarn task e2e-tests-dev --start-from auto` for E2E coverage
 - Use `yarn task test-runner --start-from auto` or `yarn task test-runner-dev --start-from auto` for test-runner scenarios
 - Use `yarn task smoke-test --start-from auto` for smoke checks
-- Use `cd code && yarn playwright test e2e-internal/tools-attach.spec.ts --config playwright.config.ts` for tools attach coverage (same checkout as the running internal UI)
+- Use `cd code && yarn playwright test -c e2e-internal/playwright.config.ts e2e-internal/tools-attach.spec.ts` for tools attach coverage (same checkout as the running internal UI)
 
 Watch-mode commands:
 

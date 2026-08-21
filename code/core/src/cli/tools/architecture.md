@@ -25,7 +25,8 @@ Accepted constraints:
 - The upgrade handler accepts a missing `Origin` when the token is valid. Browser rules stay
   unchanged.
 - CLI default is attach-preferred. `--attach` requires attachment. `--no-attach` forces local.
-- Gate failures print the exact corrective command. In `auto` they then fall back to local.
+- Factory-time gate failures print the exact corrective command. In `auto` they then fall back to
+  local. Post-attach `tools.call` failures (disconnect, remote ack timeout) do not fall back.
 - `storybook tools` and `storybook ai` both consume the SDK. There is no `mcp-client`, no
   `PROXY_VIA_MCP_METHODS`, and no `X-Storybook-MCP-Proxy` header on this path.
 - Attach coverage lives in `code/e2e-internal/`. Filesystem unit tests use memfs.
@@ -70,8 +71,9 @@ module resolution, `.env`, and relative paths match the instance. A version mism
 invoked package (for example `npx storybook@latest` from the right directory) also triggers the
 child via project-local resolution. When the package resolved under the instance cwd **also**
 mismatches the record (server started before a dependency upgrade), spawning cannot help: the
-error is "restart your Storybook". The SDK must never `chdir` its host; the child host is the
-honest implementation of `cwd`.
+error is "restart your Storybook". Attached mode never `chdir`s the host; the child host is the
+honest implementation of `cwd`. Local mode does `process.chdir` to the target for the rest of
+the one-shot process.
 
 ### ADR-A6: Spawn safety rails
 
@@ -95,8 +97,11 @@ A bare `.get()` before snapshots arrive reads initial state — the same semanti
 start-your-Storybook guidance. In attached mode it is moot. `stories.preview` runs caller-side
 and reads origin from the record.
 
-(b) Toolset-level telemetry fires caller-side. Command-level side effects and their telemetry
-land on the instance. Event name `tools-command` stays; the payload includes `attachMode`.
+(b) The CLI fires an outer `tools-command` invocation event after a run. Per-method toolset
+telemetry (`ctx.telemetry`) fires caller-side in **local** dispatch. Attached dispatch calls
+`tools.call` without a telemetry sink, so per-method toolset events do not fire there yet.
+Command-level side effects and their telemetry still land on the instance. Event name
+`tools-command` stays; the payload includes `attachMode`.
 
 ### ADR-A9: The SDK is the architecture's core; the CLI is a slim shell over it
 
@@ -105,13 +110,16 @@ absorbs in-process bootstrap; attached mode is connect + delegated registration.
 (`attached` | `local`) and host (`in-process` | `child`) are orthogonal. The CLI parses flags,
 renders help and outcomes, and sets exit codes. It has no process-spawn logic of its own.
 
-### ADR-A10: The loader shim ships now
+### ADR-A10: Loader shim (pending)
 
-An embedder's bundled `storybook` copy must never execute toolset code (version skew). A thin,
-forever-stable loader resolves the real implementation from the project's installation
-(`require.resolve('storybook/internal/tools', { paths: [projectDir] })` + dynamic import) and
-forwards `createTools` verbatim. The shim chooses **which code**; auto-spawn chooses **which
-environment**.
+An embedder's bundled `storybook` copy must never execute toolset code (version skew). The intended
+fix is a thin, forever-stable loader that resolves the real implementation from the project's
+installation (`require.resolve('storybook/internal/tools', { paths: [projectDir] })` + dynamic
+import) and forwards `createTools` verbatim. The shim chooses **which code**; auto-spawn chooses
+**which environment**.
+
+This ADR is accepted as design. The implementation is not in this stack yet; it lives in draft
+#35989. Until that lands, `createTools` is the in-repo SDK entry, not a project-local loader.
 
 ### ADR-A11: Auto-spawn child host, with rails
 
@@ -162,7 +170,9 @@ Messages must name the exact corrective command.
 | Spawn resolution failure          | No `storybook` under `record.cwd`     | `SpawnFailedError` remediation; local fallback                                                   |
 | Config drift                      | Remote command ack timeout            | Running Storybook was started with a different configuration — restart it                        |
 
-Under `--attach`, all of these are hard errors with the same text. In `auto`, fallback-with-notice.
+Rows other than config drift are factory-time attach gates. In `auto`, those return a local host
+and a fallback notice (omitted from `--json` output). Under `--attach`, they are hard errors with
+the same text. Config drift is a post-attach `tools.call` failure: `auto` does not fall back then.
 
 ## Risks
 
@@ -193,5 +203,5 @@ close, mode, storybook }`.
   triggers the child host.
 - **Child host**: the project-local, right-cwd child serving the SDK API over parent-child Node
   IPC; the parent `Tools` is a proxy.
-- **Loader shim**: the thin forever-stable entry that resolves the real SDK from the target
-  project's installation.
+- **Loader shim**: (pending, #35989) the thin forever-stable entry that resolves the real SDK from
+  the target project's installation. Not shipped on this head.

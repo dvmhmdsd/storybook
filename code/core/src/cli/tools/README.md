@@ -25,14 +25,23 @@ const tools = await createTools({
 
 tools.mode; // 'attached' | 'local'
 tools.storybook; // { version, configDir, url?, pid? }
-await tools.describe({ toolset? });
-await tools.call('docs.show', { id: 'button' }, { signal? });
+await tools.describe();
+await tools.describe({ toolset: 'docs' });
+await tools.call('docs.show', { id: 'button' });
+await tools.call('docs.show', { id: 'button' }, { signal: AbortSignal.timeout(5_000) });
 await tools.close();
 ```
 
-`createTools` throws `AttachUnavailableError`, `EnvironmentMismatchError`, or `SpawnFailedError`.
-`call` throws `ToolsRuntimeError` on faults and returns a `ToolsetOutcome` when the tool ran
-(including `ok: false`).
+Factory vs `call`:
+
+| Mode       | Operation                         | Result                                                                                                                                                                                                 |
+| ---------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `attached` | Factory cannot attach or spawn    | Throws `AttachUnavailableError`, `EnvironmentMismatchError`, or `SpawnFailedError`                                                                                                                     |
+| `auto`     | Factory cannot attach or spawn    | Returns a local host with `fallbackNotice`. Those three errors are not thrown unless local load also fails                                                                                             |
+| `local`    | Config cannot load                | Throws `ToolsRuntimeError` (`config-load-failed`)                                                                                                                                                      |
+| any        | `call` after a successful factory | `ToolsRuntimeError` on SDK faults (`unknown-method`, `invalid-input`, `closed`, `connection-lost`). Local `requiresDevServer` methods throw `AttachUnavailableError`. A tool that ran returns a `ToolsetOutcome` (`ok: false` is not a throw). Open-service dispatch can still throw its own typed errors. |
+
+`auto` fallback is factory-time only. A later `call` failure (disconnect, remote ack timeout) does not switch to local.
 
 `kind` defaults to `sdk`. The `storybook tools` CLI stamps `cli`. Do not value-export
 `bootstrapToolsRuntime` from the SDK barrel: a static import of the local runtime loads
@@ -41,8 +50,9 @@ exists.
 
 ## CLI flags
 
-Default mode is `auto`: attach when a matching instance is running, otherwise load locally and
-print a fallback notice.
+Default mode is `auto`: attach when a matching instance is running, otherwise load locally.
+Human-readable CLI output prepends `fallbackNotice` to stdout (and to `-o` when `--json` is not
+set). `--json` keeps only the tool result.
 
 | Flag          | SDK `mode` | On gate failure                  |
 | ------------- | ---------- | -------------------------------- |
@@ -69,7 +79,7 @@ npx storybook tools --port 6007 docs list
 
 **Attached.** Discover `~/.storybook/instances/*.json`, connect with `createNodeChannel` to
 `/storybook-server-channel?token=…` (no Origin), load the instance config as a **leaf** and
-**follower**, set `setDelegatedMode(true)` before the first `registerService`. The SDK never
+**follower**, set `setDelegatedMode(true)` before the first `registerService`. This path never
 `chdir`s the host process.
 
 **Child host.** When `process.cwd()` or the resolved `storybook` version does not match the
@@ -85,7 +95,7 @@ makes UniversalStore a follower before core loads, and local bootstrap must be a
 ## Tests
 
 - Unit: `yarn test cli/tools` (memfs for the instance registry; no direct `globalThis` assignment)
-- Attach e2e: `cd code && yarn playwright test e2e-internal/tools-attach.spec.ts --config playwright.config.ts`
+- Attach e2e: `cd code && yarn playwright test -c e2e-internal/playwright.config.ts e2e-internal/tools-attach.spec.ts`
 
 Run e2e from the same checkout that serves the internal UI. A worktree CLI talking to a
 `/workspace` instance will load the wrong `.storybook` and fail on duplicate `core-server`.
