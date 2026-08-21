@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { serializeError } from '../../../shared/open-service/service-error-serialization.ts';
 import { spawnChildHost } from './child-client.ts';
 import { CHILD_HOST_PROTOCOL_VERSION } from './child-protocol.ts';
-import { SpawnFailedError, ToolsRuntimeError } from './errors.ts';
+import { SpawnFailedError, ToolsRuntimeError, AttachUnavailableError } from './errors.ts';
 import type { StorybookInstanceRecord } from '../instances/types.ts';
 import type { CreateToolsOptions, ToolsClientInfo } from './types.ts';
 
@@ -99,6 +99,7 @@ describe('spawnChildHost', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 
@@ -194,6 +195,45 @@ describe('spawnChildHost', () => {
     await expect(pending).rejects.toThrow();
   });
 
+  it('rejects the caller when the signal aborts even if the child never replies', async () => {
+    child.send.mockImplementation((message: { type: string; id?: string }) => {
+      if (message.type === 'init') {
+        queueMicrotask(() => child.emit('message', HELLO));
+      }
+      return true;
+    });
+    const tools = await spawn();
+    const controller = new AbortController();
+
+    const pending = tools.call('docs.list', {}, { signal: controller.signal });
+    await vi.waitFor(() => {
+      expect(child.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'call' }));
+    });
+    controller.abort('stopped');
+
+    await expect(pending).rejects.toBe('stopped');
+    expect(child.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'cancel' }));
+  });
+
+  it('rejects in-flight requests when the proxy is closed', async () => {
+    child.send.mockImplementation((message: { type: string; id?: string }) => {
+      if (message.type === 'init') {
+        queueMicrotask(() => child.emit('message', HELLO));
+      }
+      return true;
+    });
+    const tools = await spawn();
+    const pending = tools.call('docs.list');
+    await vi.waitFor(() => {
+      expect(child.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'call' }));
+    });
+
+    await tools.close();
+
+    await expect(pending).rejects.toMatchObject({ data: { reason: 'closed' } });
+    expect(child.kill).toHaveBeenCalled();
+  });
+
   it('kills the child when the proxy is closed', async () => {
     const tools = await spawn();
 
@@ -280,6 +320,45 @@ describe('spawnChildHost', () => {
       return true;
     });
 
+    await expect(tools.call('nope.list')).rejects.toBeInstanceOf(ToolsRuntimeError);
     await expect(tools.call('nope.list')).rejects.toThrow('Unknown toolset `nope`.');
+  });
+
+  it('rehydrates a serialized AttachUnavailableError from child init so instanceof matches', async () => {
+    child.send.mockImplementation((message: { type: string }) => {
+      if (message.type === 'init') {
+        queueMicrotask(() =>
+          child.emit('message', {
+            type: 'error',
+            id: 'init',
+            error: serializeError(
+              new AttachUnavailableError({
+                reason: 'no-instance',
+                instances: [],
+                remediation: 'No running Storybook was found for this project.',
+              })
+            ),
+          })
+        );
+      }
+      return true;
+    });
+
+    const failure = spawn();
+
+    await expect(failure).rejects.toBeInstanceOf(AttachUnavailableError);
+    await expect(failure).rejects.toThrow('No running Storybook was found');
+    expect(child.kill).toHaveBeenCalled();
+  });
+
+  it('throws SpawnFailedError when the child never says hello', async () => {
+    vi.useFakeTimers();
+    child.send.mockImplementation(() => true);
+
+    const pending = spawn();
+    const assertion = expect(pending).rejects.toThrow(/did not become ready in time/);
+    await vi.advanceTimersByTimeAsync(10_000);
+    await assertion;
+    expect(child.kill).toHaveBeenCalled();
   });
 });

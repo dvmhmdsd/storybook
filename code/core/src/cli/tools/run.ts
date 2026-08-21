@@ -9,15 +9,16 @@ import type {
 import { parseToolsetMethodId, toCliMethodName } from '../../shared/open-service/toolset-names.ts';
 import type { StorybookInstanceRecord } from './instances/types.ts';
 import {
-  AttachUnavailableError,
   createTools,
-  EnvironmentMismatchError,
-  SpawnFailedError,
+  isAttachGateError,
+  type CreateToolsDeps,
+  type CreateToolsOptions,
   type Tools,
   type ToolsClientInfo,
   type ToolsMode,
   type ToolsRuntime,
 } from './sdk/index.ts';
+import { formatPortMismatch } from './sdk/attach-messages.ts';
 import {
   discoverRunningInstance,
   type InstanceDiscovery,
@@ -63,6 +64,8 @@ export type ToolsRunResult = {
   outputPath?: string;
   /** Requested or resolved attach mode for the `tools-command` event. */
   attachMode: ToolsMode;
+  /** Set when `auto` could not attach and loaded the project configuration instead. */
+  fallbackNotice?: string;
 };
 
 export type ToolsInvocation = {
@@ -86,7 +89,7 @@ const CLI_CLIENT_INFO: ToolsClientInfo = {
 
 /** Injectable dependencies for tests. */
 export type ToolsRunDeps = {
-  createTools?: typeof createTools;
+  createTools?: (options?: CreateToolsOptions, deps?: CreateToolsDeps) => Promise<Tools>;
   discoverInstance?: typeof discoverRunningInstance;
   /** Sink for the per-method toolset telemetry events; absent when telemetry is disabled. */
   methodTelemetry?: ToolsetTelemetry;
@@ -124,14 +127,6 @@ function resolveToolsMode(
     return 'local';
   }
   return 'auto';
-}
-
-function isAttachGateError(error: unknown): boolean {
-  return (
-    error instanceof AttachUnavailableError ||
-    error instanceof EnvironmentMismatchError ||
-    error instanceof SpawnFailedError
-  );
 }
 
 /**
@@ -196,13 +191,9 @@ export async function runToolsCommand(
   try {
     const dispatched =
       tools.mode === 'attached'
-        ? await dispatchAttachedTools(tools, normalized, parsed, result)
+        ? await dispatchAttachedTools(tools, normalized, parsed, result, deps)
         : await dispatchLocalTools(tools, normalized, parsed, deps, requestedMode, result);
-    const output =
-      tools.fallbackNotice && !parsed.json
-        ? `${tools.fallbackNotice}\n\n${dispatched.output}`
-        : dispatched.output;
-    return { ...dispatched, output, attachMode: tools.mode };
+    return { ...dispatched, attachMode: tools.mode, fallbackNotice: tools.fallbackNotice };
   } finally {
     await tools.close();
   }
@@ -212,10 +203,23 @@ async function dispatchAttachedTools(
   tools: Tools,
   invocation: ToolsInvocation,
   parsed: Extract<ParsedToolsTokens, { ok: true }>,
-  result: (partial: Omit<ToolsRunResult, 'outputPath' | 'attachMode'>) => ToolsRunResult
+  result: (partial: Omit<ToolsRunResult, 'outputPath' | 'attachMode'>) => ToolsRunResult,
+  deps: ToolsRunDeps
 ): Promise<ToolsRunResult> {
   const { toolset: toolsetName, tool: toolName } = invocation;
-  const catalog = await tools.describe();
+  let catalog;
+  try {
+    catalog = await tools.describe();
+  } catch (error) {
+    if (isAgentFacingError(error)) {
+      return result({ exitCode: 1, output: error.message, outcome: { kind: 'failure' } });
+    }
+    return result({
+      exitCode: 1,
+      output: error instanceof Error ? error.message : String(error),
+      outcome: { kind: 'error', error },
+    });
+  }
 
   if (!toolsetName) {
     return result({
@@ -263,7 +267,10 @@ async function dispatchAttachedTools(
   }
 
   try {
-    const outcome = await tools.call(method.ref, parsed.args);
+    const outcome = await tools.call(method.ref, parsed.args, {
+      ...(tools.storybook.url ? { origin: tools.storybook.url } : {}),
+      ...(deps.methodTelemetry ? { telemetry: deps.methodTelemetry } : {}),
+    });
     const output = parsed.json
       ? JSON.stringify(outcome.data, null, 2)
       : joinMarkdown(outcome.markdown);
@@ -451,6 +458,13 @@ function formatRequiresDevServer(
   discovery: InstanceDiscovery,
   requestedMode: ToolsMode
 ): string {
+  if (discovery.portMismatch) {
+    return `\`${commandPath}\` requires a running Storybook on port \`${
+      discovery.portMismatch.port
+    }\`.
+
+${formatPortMismatch(discovery.portMismatch.port, discovery.portMismatch.projectRecords)}`;
+  }
   if (discovery.currentRecord && requestedMode === 'local') {
     return `Found your Storybook running at ${discovery.currentRecord.url}, but \`${commandPath}\` cannot run from a local tools host. Re-run without \`--no-attach\` to attach to that instance.`;
   }

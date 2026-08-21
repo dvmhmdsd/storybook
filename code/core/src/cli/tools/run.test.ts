@@ -83,11 +83,12 @@ function makeLocalTools(runtimeOverrides: Partial<ToolsRuntime> = {}): LocalTool
     ...runtimeOverrides,
   };
   const ctx: ToolsetCtx = { transport: 'cli', getService: runtime.getService };
+  const storybook = { version: '0.0.0', configDir: runtime.configDir };
   return {
     mode: 'local',
     clientInfo: { name: 'storybook-cli', version: '0.0.0', kind: 'cli' },
     runtime,
-    storybook: { version: '0.0.0', configDir: runtime.configDir },
+    storybook,
     describe: async (options) => {
       const toolsets =
         options?.toolset === undefined
@@ -98,7 +99,7 @@ function makeLocalTools(runtimeOverrides: Partial<ToolsRuntime> = {}): LocalTool
         toolsets: toolsets.map((toolset) => toCatalogEntry(toolset, ctx)),
       };
     },
-    call: async (ref, input) => {
+    call: async (ref, input, options = {}) => {
       const { toolsetId, methodName } = parseToolsetMethodId(ref);
       const toolset = runtime.toolsets.find((candidate) => candidate.id === toolsetId);
       const method = toolset?.methods[methodName];
@@ -109,7 +110,11 @@ function makeLocalTools(runtimeOverrides: Partial<ToolsRuntime> = {}): LocalTool
       if (validation.issues) {
         throw new Error(`Invalid input for \`${ref}\``);
       }
-      return method.handler(validation.value, ctx);
+      return method.handler(validation.value, {
+        ...ctx,
+        ...(options.origin ? { origin: options.origin } : {}),
+        ...(options.telemetry ? { telemetry: options.telemetry } : {}),
+      });
     },
     close: async () => {},
   };
@@ -150,7 +155,12 @@ function makeAttachedTools(runtimeOverrides: Partial<ToolsRuntime> = {}): Attach
         toolsets: toolsets.map((toolset) => toCatalogEntry(toolset, ctx)),
       };
     },
-    call: async (ref, input) => {
+    call: async (ref, input, options) => {
+      const callCtx: ToolsetCtx = {
+        ...ctx,
+        ...(options?.origin !== undefined ? { origin: options.origin } : {}),
+        ...(options?.telemetry ? { telemetry: options.telemetry } : {}),
+      };
       const { toolsetId, methodName } = parseToolsetMethodId(ref);
       const toolset = local.runtime.toolsets.find((candidate) => candidate.id === toolsetId);
       const method = toolset?.methods[methodName];
@@ -161,7 +171,7 @@ function makeAttachedTools(runtimeOverrides: Partial<ToolsRuntime> = {}): Attach
       if (validation.issues) {
         throw new Error(`Invalid input for \`${ref}\``);
       }
-      return method.handler(validation.value, ctx);
+      return method.handler(validation.value, callCtx);
     },
   };
 }
@@ -351,6 +361,27 @@ describe('requires-dev-server contract', () => {
 
     expect(result.output).toContain('http://localhost:6006');
     expect(result.output).toContain('--cwd');
+  });
+
+  it('reports a port-mismatch instead of recommending a different instance', async () => {
+    const { deps } = makeDeps({
+      discoverInstance: vi.fn(async () => ({
+        currentRecord: undefined,
+        records: [RECORD],
+        portMismatch: { port: 9999, projectRecords: [RECORD] },
+      })),
+    });
+
+    const result = await run(
+      ['stories', 'preview', '--stories', '[{"storyId":"button--primary"}]'],
+      deps,
+      { target: { port: 9999 } }
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(result.outcome).toEqual({ kind: 'intercept', reason: 'requires-dev-server' });
+    expect(result.output).toContain('not on port `9999`');
+    expect(result.output).toContain('port `6006`');
   });
 
   it('intercepts stories preview in local mode even when an instance is running', async () => {
@@ -680,6 +711,21 @@ describe('telemetry sink', () => {
       expect.objectContaining({ toolset: 'docs' })
     );
   });
+
+  it('forwards per-method events on attached dispatch', async () => {
+    const methodTelemetry = vi.fn(async () => {});
+    const { deps } = makeDeps({
+      methodTelemetry,
+      createTools: vi.fn(async () => makeAttachedTools()),
+    });
+
+    await run(['docs', 'list'], deps, { attach: true });
+
+    expect(methodTelemetry).toHaveBeenCalledWith(
+      'tool:listAllDocumentation',
+      expect.objectContaining({ toolset: 'docs' })
+    );
+  });
 });
 
 describe('host failures', () => {
@@ -776,7 +822,7 @@ describe('attached tools', () => {
     expect(result.output).toContain('--attach');
   });
 
-  it('prints the SDK fallback notice ahead of a local result', async () => {
+  it('prints the SDK fallback notice separately from the local result', async () => {
     const tools = makeLocalTools();
     tools.fallbackNotice =
       "No running Storybook was found for this project.\n\nFalling back to loading this project's Storybook configuration in this process.";
@@ -788,7 +834,28 @@ describe('attached tools', () => {
 
     expect(createTools).toHaveBeenCalledWith(expect.objectContaining({ mode: 'auto' }));
     expect(result.attachMode).toBe('local');
-    expect(result.output).toContain('Falling back to loading this project');
+    expect(result.fallbackNotice).toContain('Falling back to loading this project');
     expect(result.output).toContain('Button');
+    expect(result.output).not.toContain('Falling back');
+  });
+
+  it('maps catalog failures onto the command runner error contract', async () => {
+    const { deps } = makeDeps({
+      createTools: vi.fn(async () => ({
+        ...makeAttachedTools(),
+        describe: async () => {
+          throw new ToolsRuntimeError({
+            reason: 'connection-lost',
+            message: 'The tools child host exited.',
+          });
+        },
+      })),
+    });
+
+    const result = await run(['docs', 'list'], deps, { attach: true });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.outcome.kind).toBe('error');
+    expect(result.output).toContain('The tools child host exited.');
   });
 });
